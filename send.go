@@ -166,6 +166,192 @@ type SendRequestExtra struct {
 // in binary/proto/def.proto may be useful to find out all the allowed fields. Printing the RawMessage
 // field in incoming message events to figure out what it contains is also a good way to learn how to
 // send the same kind of message.
+func (cli *Client) SendBroadcastMessage(ctx context.Context, to types.JID, recipients []types.JID, message *waE2E.Message) (resp SendResponse, err error) {
+	if cli == nil {
+		err = ErrClientIsNil
+		return
+	}
+	var req SendRequestExtra
+	if to.Device > 0 && !req.Peer {
+		err = ErrRecipientADJID
+		return
+	}
+	ownID := cli.getOwnID()
+	if ownID.IsEmpty() {
+		err = ErrNotLoggedIn
+		return
+	}
+
+	if req.Timeout == 0 {
+		req.Timeout = defaultRequestTimeout
+	}
+	if len(req.ID) == 0 {
+		req.ID = cli.GenerateMessageID()
+	}
+	resp.ID = req.ID
+	isInlineBotMode := false
+
+	if !req.InlineBotJID.IsEmpty() {
+		if !req.InlineBotJID.IsBot() {
+			err = ErrInvalidInlineBotID
+			return
+		}
+		isInlineBotMode = true
+	}
+
+	isBotMode := isInlineBotMode || to.IsBot()
+	var botNode *waBinary.Node
+
+	if isBotMode {
+		if message.MessageContextInfo == nil {
+			message.MessageContextInfo = &waE2E.MessageContextInfo{}
+		}
+
+		if message.MessageContextInfo.MessageSecret == nil {
+			message.MessageContextInfo.MessageSecret = random.Bytes(32)
+		}
+
+		if message.MessageContextInfo.BotMetadata == nil {
+			message.MessageContextInfo.BotMetadata = &waE2E.BotMetadata{
+				PersonaID: proto.String("867051314767696$760019659443059"),
+			}
+		}
+
+		if isInlineBotMode {
+			// inline mode specific code
+			messageSecret := message.GetMessageContextInfo().GetMessageSecret()
+			message = &waE2E.Message{
+				BotInvokeMessage: &waE2E.FutureProofMessage{
+					Message: &waE2E.Message{
+						ExtendedTextMessage: message.ExtendedTextMessage,
+						MessageContextInfo: &waE2E.MessageContextInfo{
+							BotMetadata: message.MessageContextInfo.BotMetadata,
+						},
+					},
+				},
+				MessageContextInfo: message.MessageContextInfo,
+			}
+
+			botMessage := &waE2E.Message{
+				BotInvokeMessage: message.BotInvokeMessage,
+				MessageContextInfo: &waE2E.MessageContextInfo{
+					BotMetadata:      message.MessageContextInfo.BotMetadata,
+					BotMessageSecret: applyBotMessageHKDF(messageSecret),
+				},
+			}
+
+			messagePlaintext, _, marshalErr := marshalMessage(req.InlineBotJID, botMessage)
+			if marshalErr != nil {
+				err = marshalErr
+				return
+			}
+
+			participantNodes, _ := cli.encryptMessageForDevices(ctx, []types.JID{req.InlineBotJID}, ownID, resp.ID, messagePlaintext, nil, waBinary.Attrs{})
+			botNode = &waBinary.Node{
+				Tag:     "bot",
+				Attrs:   nil,
+				Content: participantNodes,
+			}
+		}
+	}
+
+	start := time.Now()
+	// Sending multiple messages at a time can cause weird issues and makes it harder to retry safely
+	cli.messageSendLock.Lock()
+	resp.DebugTimings.Queue = time.Since(start)
+	defer cli.messageSendLock.Unlock()
+
+	respChan := cli.waitResponse(req.ID)
+	// Peer message retries aren't implemented yet
+	if !req.Peer {
+		cli.addRecentMessage(to, req.ID, message, nil)
+	}
+
+	if message.GetMessageContextInfo().GetMessageSecret() != nil {
+		err = cli.Store.MsgSecrets.PutMessageSecret(to, ownID, req.ID, message.GetMessageContextInfo().GetMessageSecret())
+		if err != nil {
+			cli.Log.Warnf("Failed to store message secret key for outgoing message %s: %v", req.ID, err)
+		} else {
+			cli.Log.Debugf("Stored message secret key for outgoing message %s", req.ID)
+		}
+	}
+	var phash string
+	var data []byte
+	phash, data, err = cli.sendToBroadcastGroup(ctx, to, ownID, req.ID, recipients, message, &resp.DebugTimings, botNode)
+
+	start = time.Now()
+	if err != nil {
+		cli.cancelResponse(req.ID, respChan)
+		return
+	}
+	var respNode *waBinary.Node
+	var timeoutChan <-chan time.Time
+	if req.Timeout > 0 {
+		timeoutChan = time.After(req.Timeout)
+	} else {
+		timeoutChan = make(<-chan time.Time)
+	}
+	select {
+	case respNode = <-respChan:
+	case <-timeoutChan:
+		cli.cancelResponse(req.ID, respChan)
+		err = ErrMessageTimedOut
+		return
+	case <-ctx.Done():
+		cli.cancelResponse(req.ID, respChan)
+		err = ctx.Err()
+		return
+	}
+	resp.DebugTimings.Resp = time.Since(start)
+	if isDisconnectNode(respNode) {
+		start = time.Now()
+		respNode, err = cli.retryFrame("message send", req.ID, data, respNode, ctx, 0)
+		resp.DebugTimings.Retry = time.Since(start)
+		if err != nil {
+			return
+		}
+	}
+	ag := respNode.AttrGetter()
+	resp.ServerID = types.MessageServerID(ag.OptionalInt("server_id"))
+	resp.Timestamp = ag.UnixTime("t")
+	if errorCode := ag.Int("error"); errorCode != 0 {
+		err = fmt.Errorf("%w %d", ErrServerReturnedError, errorCode)
+	}
+	expectedPHash := ag.OptionalString("phash")
+	if len(expectedPHash) > 0 && phash != expectedPHash {
+		cli.Log.Warnf("Server returned different participant list hash when sending to %s. Some devices may not have received the message.", to)
+		// TODO also invalidate device list caches
+		cli.groupParticipantsCacheLock.Lock()
+		delete(cli.groupParticipantsCache, to)
+		cli.groupParticipantsCacheLock.Unlock()
+	}
+	return
+}
+
+// SendMessage sends the given message.
+//
+// This method will wait for the server to acknowledge the message before returning.
+// The return value is the timestamp of the message from the server.
+//
+// Optional parameters like the message ID can be specified with the SendRequestExtra struct.
+// Only one extra parameter is allowed, put all necessary parameters in the same struct.
+//
+// The message itself can contain anything you want (within the protobuf schema).
+// e.g. for a simple text message, use the Conversation field:
+//
+//	cli.SendMessage(context.Background(), targetJID, &waProto.Message{
+//		Conversation: proto.String("Hello, World!"),
+//	})
+//
+// Things like replies, mentioning users and the "forwarded" flag are stored in ContextInfo,
+// which can be put in ExtendedTextMessage and any of the media message types.
+//
+// For uploading and sending media/attachments, see the Upload method.
+//
+// For other message types, you'll have to figure it out yourself. Looking at the protobuf schema
+// in binary/proto/def.proto may be useful to find out all the allowed fields. Printing the RawMessage
+// field in incoming message events to figure out what it contains is also a good way to learn how to
+// send the same kind of message.
 func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E.Message, extra ...SendRequestExtra) (resp SendResponse, err error) {
 	if cli == nil {
 		err = ErrClientIsNil
@@ -603,6 +789,73 @@ func (cli *Client) sendNewsletter(to types.JID, id types.MessageID, message *waP
 		return nil, fmt.Errorf("failed to send message node: %w", err)
 	}
 	return data, nil
+}
+
+func (cli *Client) sendToBroadcastGroup(ctx context.Context, to, ownID types.JID, id types.MessageID, participants []types.JID, message *waProto.Message, timings *MessageDebugTimings, botNode *waBinary.Node) (string, []byte, error) {
+	var err error
+	start := time.Now()
+	if to.Server != types.BroadcastServer {
+		return "", nil, fmt.Errorf("can't send to a non-broadcast group %s", to)
+	}
+
+	timings.GetParticipants = time.Since(start)
+	start = time.Now()
+	plaintext, _, err := marshalMessage(to, message)
+	timings.Marshal = time.Since(start)
+	if err != nil {
+		return "", nil, err
+	}
+
+	start = time.Now()
+	builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
+	senderKeyName := protocol.NewSenderKeyName(to.String(), ownID.SignalAddress())
+	signalSKDMessage, err := builder.Create(senderKeyName)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create sender key distribution message to send %s to %s: %w", id, to, err)
+	}
+	skdMessage := &waE2E.Message{
+		SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{
+			GroupID:                             proto.String(to.String()),
+			AxolotlSenderKeyDistributionMessage: signalSKDMessage.Serialize(),
+		},
+	}
+	skdPlaintext, err := proto.Marshal(skdMessage)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to marshal sender key distribution message to send %s to %s: %w", id, to, err)
+	}
+
+	cipher := groups.NewGroupCipher(builder, senderKeyName, cli.Store)
+	encrypted, err := cipher.Encrypt(padMessage(plaintext))
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to encrypt group message to send %s to %s: %w", id, to, err)
+	}
+	ciphertext := encrypted.SignedSerialize()
+	timings.GroupEncrypt = time.Since(start)
+
+	node, allDevices, err := cli.prepareMessageNode(ctx, to, ownID, id, message, participants, skdPlaintext, nil, timings, botNode)
+	if err != nil {
+		return "", nil, err
+	}
+
+	phash := participantListHashV2(allDevices)
+	node.Attrs["phash"] = phash
+	skMsg := waBinary.Node{
+		Tag:     "enc",
+		Content: ciphertext,
+		Attrs:   waBinary.Attrs{"v": "2", "type": "skmsg"},
+	}
+	if mediaType := getMediaTypeFromMessage(message); mediaType != "" {
+		skMsg.Attrs["mediatype"] = mediaType
+	}
+	node.Content = append(node.GetChildren(), skMsg)
+
+	start = time.Now()
+	data, err := cli.sendNodeAndGetData(*node)
+	timings.Send = time.Since(start)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to send message node: %w", err)
+	}
+	return phash, data, nil
 }
 
 func (cli *Client) sendGroup(ctx context.Context, to, ownID types.JID, id types.MessageID, message *waProto.Message, timings *MessageDebugTimings, botNode *waBinary.Node) (string, []byte, error) {
